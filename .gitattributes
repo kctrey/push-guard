@@ -1,0 +1,6 @@
+# Scripts must keep LF line endings even on Windows checkouts (core.autocrlf=true), otherwise the
+# shebang and shell lines end in \r. Git Bash happens to tolerate it, other shells and Python don't.
+*.sh      text eol=lf
+*.py      text eol=lf
+hooks/*   text eol=lf
+*.txt     text eol=lf

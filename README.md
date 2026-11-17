@@ -54,7 +54,7 @@ repo, then push again. This way an automated tool can't confirm on your behalf.
 
 ## Install
 
-Needs `git` and `python3` (macOS or Linux).
+Needs `git` and Python 3.8+ (`python3`). Works on macOS, Linux and Windows.
 
 ```sh
 ./install.sh                    # check every repo on this machine (recommended)
@@ -63,6 +63,31 @@ Needs `git` and `python3` (macOS or Linux).
 
 Re-running it updates the code and keeps your local lists. To remove it: `./uninstall.sh`
 (add `--purge` to also delete your local lists).
+
+### Windows
+
+Install [Git for Windows](https://git-scm.com/download/win) and Python from
+[python.org](https://www.python.org/downloads/windows/) (the `python3` that Windows ships is only
+a Microsoft Store placeholder). Then run the same commands **from Git Bash**:
+
+```sh
+./install.sh                 # every repo
+./install.sh ~/work /c/src   # or only these folders
+```
+
+The installer finds a working Python (`py -3`, `python` or `python3`) and records it, so
+**re-run `./install.sh` after you upgrade to a new Python version** (e.g. 3.13 → 3.14).
+It puts `push-guard` (Git Bash) and `push-guard.cmd` (PowerShell / cmd) in `~/.local/bin` if that
+folder exists, otherwise in `~/.config/git/push-guard/bin`. Add that folder to your PATH to type
+plain `push-guard`.
+
+- `git push` in **PowerShell, cmd, Windows Terminal or the VS Code terminal** asks inline, as
+  on a Mac.
+- In the **standalone Git Bash window** (mintty) git can't hand the hook a terminal, so the push
+  is blocked with a list of findings. Run `push-guard --review` in that same window, then push again.
+- Single English words in your spreadsheets are skipped using the system word list, and Windows
+  doesn't have one. To get the same filtering, save a one-word-per-line list as
+  `~/.config/git/push-guard/words.txt`.
 
 ## Setup (optional)
 

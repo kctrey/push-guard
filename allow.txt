@@ -1,0 +1,4 @@
+# push-guard allowlist — values that are never flagged. One per line: an exact value
+# (case-insensitive) or a /regex/. Prefer confirming items as demo when asked; use this only
+# for things that are never customer data, e.g. your team's shared test address.
+# Example:  /@example\.com$/

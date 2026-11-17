@@ -1,0 +1,9 @@
+#!/bin/sh
+# push-guard pass-through: core.hooksPath bypasses .git/hooks, so run the repo's own hook if it has one.
+# Look in the repo's real hooks folder (git-common-dir); `--git-path hooks` would point back here.
+name=$(basename "$0")
+dir="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
+own="$dir/hooks/$name"
+here="$(cd "$(dirname "$0")" && pwd -P)"
+[ -x "$own" ] && [ "$(cd "$(dirname "$own")" && pwd -P)" != "$here" ] && exec "$own" "$@"
+exit 0

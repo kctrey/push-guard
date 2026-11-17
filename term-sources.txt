@@ -1,0 +1,4 @@
+# Optional: folders holding your customer spreadsheets (.xlsx). push-guard reads the customer /
+# account / opportunity name columns and also flags those exact names. One folder per line, ~ allowed.
+# The generated list (customer-terms.txt) never leaves your machine.
+# ~/Documents/customer-exports

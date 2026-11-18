@@ -25,10 +25,20 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+WINDOWS = os.name == "nt"
+# Findings quote arbitrary repo content: never crash on a character the console/pipe can't encode.
+# Git, mintty and IDEs read hook output as UTF-8 (on Windows Python would otherwise use cp1252).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 HERE = Path(__file__).resolve().parent
 TERMS_FILE = HERE / "customer-terms.txt"
@@ -110,13 +120,23 @@ DEFAULT_ALLOW = [
 
 # ── helpers ──────────────────────────────────────────────────────────────────────────────────
 
-def git(*args: str) -> str:
-    return subprocess.run(["git", *args], capture_output=True, text=True, errors="replace").stdout
+# Git output is UTF-8 on every platform (don't decode it with the Windows ANSI code page), and
+# quotePath=false keeps non-ASCII file names readable instead of "\303\251"-escaped.
+GIT = ["git", "-c", "core.quotePath=false"]
 
 
-def git_ok(*args: str) -> tuple[bool, str]:
-    p = subprocess.run(["git", *args], capture_output=True, text=True, errors="replace")
+def git_ok(*args: str, input: str | None = None) -> tuple[bool, str]:
+    p = subprocess.run([*GIT, *args], input=input, capture_output=True, encoding="utf-8", errors="replace")
     return p.returncode == 0, p.stdout
+
+
+def git(*args: str, input: str | None = None) -> str:
+    return git_ok(*args, input=input)[1]
+
+
+def read_text(p: Path) -> str:
+    # utf-8-sig: Notepad and PowerShell may save these files with a byte-order mark.
+    return p.read_text(encoding="utf-8-sig", errors="replace")
 
 
 def repo_id() -> str:
@@ -126,7 +146,7 @@ def repo_id() -> str:
 def load_allow() -> list:
     lines = list(DEFAULT_ALLOW)
     if ALLOW_FILE.exists():
-        lines += [l.strip() for l in ALLOW_FILE.read_text().splitlines() if l.strip() and not l.startswith("#")]
+        lines += [l.strip() for l in read_text(ALLOW_FILE).splitlines() if l.strip() and not l.startswith("#")]
     rules = []
     for l in lines:
         if len(l) > 2 and l.startswith("/") and l.endswith("/"):
@@ -149,7 +169,10 @@ def refresh_terms_if_stale() -> None:
     if not REFRESH.exists() or not (HERE / "term-sources.txt").exists():
         return
     cfg = HERE / "python.txt"  # optional: path to a Python that has openpyxl (e.g. a project .venv)
-    py = cfg.read_text().strip() if cfg.exists() else "python3"
+    # Default to the Python running this hook: "python3" is often missing on Windows, or is the
+    # Microsoft Store placeholder that only prints "Python was not found".
+    py = read_text(cfg).strip().strip('"') if cfg.exists() else ""
+    py = py or sys.executable
     try:
         subprocess.run([py, "-I", str(REFRESH), "--if-stale", "--quiet"], capture_output=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
@@ -160,7 +183,7 @@ def load_terms() -> list[tuple[str, re.Pattern]]:
     if not TERMS_FILE.exists():
         return []
     out = []
-    for line in TERMS_FILE.read_text().splitlines():
+    for line in read_text(TERMS_FILE).splitlines():
         term = line.strip()
         if len(term) < 4 or term.startswith("#"):
             continue
@@ -175,12 +198,12 @@ def fingerprint(repo: str, path: str, kind: str, value: str) -> str:
 def load_reviewed() -> set[str]:
     if not REVIEWED_FILE.exists():
         return set()
-    return {l.split("\t", 1)[0] for l in REVIEWED_FILE.read_text().splitlines() if l and not l.startswith("#")}
+    return {l.split("\t", 1)[0] for l in read_text(REVIEWED_FILE).splitlines() if l and not l.startswith("#")}
 
 
 def save_reviewed(items: list[dict]) -> None:
     new = not REVIEWED_FILE.exists()
-    with REVIEWED_FILE.open("a") as f:
+    with REVIEWED_FILE.open("a", encoding="utf-8", newline="\n") as f:
         if new:
             f.write("# push-guard: items you confirmed as demo/fake data (sha256 \\t date \\t kind \\t file)\n")
         day = time.strftime("%Y-%m-%d")
@@ -205,7 +228,12 @@ def remote_known(remote: str) -> list[str]:
     shas = {l.split()[0] for l in out.splitlines() if l.strip()} if ok else set()
     if not ok:  # offline: fall back to remote-tracking refs
         shas = set(git("for-each-ref", "--format=%(objectname)", f"refs/remotes/{remote}/").split())
-    return [s for s in shas if git("cat-file", "-t", s).strip() == "commit"]
+    if not shas:
+        return []
+    # One batched lookup instead of one `git cat-file` per ref: GitHub remotes list every PR ref,
+    # and thousands of process starts take minutes on Windows.
+    out = git("cat-file", "--batch-check=%(objectname) %(objecttype)", input="\n".join(shas) + "\n")
+    return [l.split()[0] for l in out.splitlines() if l.endswith(" commit")]
 
 
 def check_line(ctx: dict, n: int, text: str, terms, allow, out: list) -> None:
@@ -242,15 +270,17 @@ def scan_commit(sha: str, repo: str, terms, allow, out: list) -> None:
     for i, line in enumerate(msg.splitlines(), 1):
         check_line({"repo": repo, "commit": short, "path": "(commit message)"}, i, line, terms, allow, out)
 
-    for row in git("diff-tree", "--no-commit-id", "-r", "--root", "-m", "--first-parent", "--name-status", sha).splitlines():
-        parts = row.split("\t")
-        if len(parts) < 2 or parts[0][:1] not in ("A", "M", "R", "C"):
+    # --raw gives the new blob id directly (":100644 100644 <old> <new> M\tpath"), so no extra
+    # `git rev-parse` per file.
+    for row in git("diff-tree", "--no-commit-id", "-r", "--root", "-m", "--first-parent", "--raw", "--no-abbrev", sha).splitlines():
+        meta, _, names = row.partition("\t")
+        meta = meta.split()
+        if not row.startswith(":") or len(meta) < 5 or meta[4][:1] not in ("A", "M", "R", "C"):
             continue
-        path = parts[-1]
+        status, blob, path = meta[4][:1], meta[3], names.split("\t")[-1]
         if allowed(path, allow) or ENV_EXAMPLE.search(path):
             continue
         ext = os.path.splitext(path)[1].lower()
-        blob = git("rev-parse", f"{sha}:{path}").strip()
         kind = None
         if SECRET_FILE.search(path):
             kind = "Secret file (.env / key)"
@@ -264,12 +294,15 @@ def scan_commit(sha: str, repo: str, terms, allow, out: list) -> None:
                 kind = "Structured data file"
         if kind:
             out.append({"repo": repo, "commit": short, "path": path, "line": 0, "kind": kind,
-                        "value": f"blob {blob}", "context": f"whole file ({parts[0][:1]})"})
+                        "value": f"blob {blob}", "context": f"whole file ({status})"})
 
     diff = git("diff-tree", "--no-commit-id", "-r", "--root", "-m", "--first-parent", "-p", "-U0",
                "--no-color", "--no-ext-diff", "--text", sha)
     path, line_no = "?", 0
-    for line in diff.splitlines():
+    # split("\n"), not splitlines(): a stray \r, \f or \x1c inside a line must not shift line numbers.
+    for line in diff.split("\n"):
+        if line.endswith("\r"):
+            line = line[:-1]
         if line.startswith("diff --git "):
             path = line.split(" b/", 1)[-1]
         elif line.startswith("@@"):
@@ -296,11 +329,70 @@ def collect(commits: list[str]) -> list[dict]:
 
 # ── review ───────────────────────────────────────────────────────────────────────────────────
 
-def open_tty():
+def _win_handle(f):
+    import msvcrt
     try:
-        return open("/dev/tty"), open("/dev/tty", "w")
-    except OSError:
-        return None, None
+        return msvcrt.get_osfhandle(f.fileno())
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _win_is_console(f) -> bool:
+    """True only for a real console handle. Not os.isatty(): that is also True for NUL."""
+    import ctypes
+    from ctypes import wintypes
+    h = _win_handle(f)
+    mode = wintypes.DWORD()
+    return h is not None and bool(ctypes.windll.kernel32.GetConsoleMode(wintypes.HANDLE(h), ctypes.byref(mode)))
+
+
+def _win_is_mintty(f) -> bool:
+    """True when f is the input pipe of a Git Bash (mintty) window, which isn't a Windows console."""
+    import ctypes
+    from ctypes import wintypes
+    h = _win_handle(f)
+    if h is None:
+        return False
+    buf = ctypes.create_string_buffer(4 + 2 * 1024)
+    if not ctypes.windll.kernel32.GetFileInformationByHandleEx(wintypes.HANDLE(h), 2, buf, ctypes.sizeof(buf)):
+        return False  # 2 = FileNameInfo
+    n = int.from_bytes(buf.raw[:4], "little")
+    name = buf.raw[4:4 + n].decode("utf-16-le", "replace")
+    # e.g. \msys-1888ae32e00d56aa-pty0-from-master-nat (newer runtimes add "-nat" for native programs)
+    return re.search(r"\\(msys|cygwin)-[0-9a-f]+-pty\d+-from-master(-nat)?$", name) is not None
+
+
+def _win_enable_ansi(f) -> None:
+    import ctypes
+    from ctypes import wintypes
+    h, mode = _win_handle(f), wintypes.DWORD()
+    k = ctypes.windll.kernel32
+    if h is not None and k.GetConsoleMode(wintypes.HANDLE(h), ctypes.byref(mode)):
+        k.SetConsoleMode(wintypes.HANDLE(h), mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+
+
+def open_tty(allow_stdin: bool = False):
+    """The user's terminal for the demo/real questions, or (None, None) when nobody can answer."""
+    if not WINDOWS:
+        try:
+            return open("/dev/tty"), open("/dev/tty", "w")
+        except OSError:
+            return None, None
+    # Windows has no /dev/tty. CONIN$ opens even for IDEs, scripts and AI assistants (they get a
+    # hidden console), so only use it when git's stderr really is a console: a terminal window.
+    if _win_is_console(sys.stderr):
+        try:
+            tin = open("CONIN$", encoding="utf-8")
+            tout = open("CONOUT$", "w", encoding="utf-8")
+        except OSError:
+            return None, None
+        _win_enable_ansi(tout)
+        return tin, tout
+    # Git Bash's own window (mintty) is a pipe, not a console. During a push stdin carries git's
+    # ref list so we can't ask there, but `push-guard --review` typed in that window can.
+    if allow_stdin and _win_is_mintty(sys.stdin):
+        return sys.stdin, sys.stdout
+    return None, None
 
 
 def fmt(f: dict) -> str:
@@ -394,7 +486,7 @@ def save_pending(findings: list[dict], refs: list[str]) -> Path:
     PENDING_DIR.mkdir(mode=0o700, exist_ok=True)
     p = pending_file()
     p.write_text(json.dumps({"repo": repo_id(), "refs": refs, "time": time.strftime("%Y-%m-%d %H:%M"),
-                             "findings": findings}, indent=1))
+                             "findings": findings}, indent=1), encoding="utf-8")
     p.chmod(0o600)
     return p
 
@@ -410,8 +502,16 @@ def print_blocked(findings: list[dict]) -> None:
     if len(files) > 25:
         e(f"  … and {len(files) - 25} more files\n")
     e("\nNo terminal to ask you in, so nothing was pushed. To confirm demo vs real data, run in your\n"
-      "own terminal (inside this repo):\n\n    push-guard --review\n\n"
+      f"own terminal (inside this repo):\n\n    {review_command()}\n\n"
       "then push again. Or run `git push` yourself from a terminal to review inline.\n")
+    if WINDOWS:
+        e("(In the Git Bash window, a push can't ask you inline; use the command above there.)\n")
+
+
+def review_command() -> str:
+    if shutil.which("push-guard"):
+        return "push-guard --review"
+    return f'"{sys.executable}" -I "{HERE / "push_guard.py"}" --review'
 
 
 # ── entry points ─────────────────────────────────────────────────────────────────────────────
@@ -429,7 +529,10 @@ def hook(argv: list[str]) -> int:
         refs.append(parts[2])
         if known is None:
             known = remote_known(remote)
-        cs = git("rev-list", f"--max-count={MAX_COMMITS}", parts[1], "--not", *known).split()
+        # Revisions go through stdin: thousands of remote refs on the command line exceed the
+        # Windows limit of 32K characters ("WinError 206: The filename or extension is too long").
+        cs = git("rev-list", f"--max-count={MAX_COMMITS}", "--stdin",
+                 input="\n".join([parts[1], *(f"^{k}" for k in known)]) + "\n").split()
         commits += [c for c in cs if c not in commits]
 
     reviewed = load_reviewed()
@@ -452,8 +555,20 @@ def hook(argv: list[str]) -> int:
     sys.stderr.write(f"push-guard: {len(commits)} commit(s) checked — nothing unreviewed{note}.\n")
     own = Path(git("rev-parse", "--git-common-dir").strip() or ".git") / "hooks" / "pre-push"
     if own.is_file() and os.access(own, os.X_OK) and own.resolve().parent != HERE / "hooks":
-        return subprocess.run([str(own), *argv[1:]], input=stdin_data, text=True).returncode
+        return subprocess.run([*hook_command(own), *argv[1:]], input=stdin_data, text=True).returncode
     return 0
+
+
+def hook_command(path: Path) -> list[str]:
+    """How to run a repo's own hook. Windows can't execute a `#!` script directly ([WinError 193]),
+    so hand it to Git's sh, which honours the shebang like Git itself does."""
+    if not WINDOWS or path.suffix.lower() in (".exe", ".bat", ".cmd"):
+        return [str(path)]
+    sh = shutil.which("sh")
+    if not sh:  # Git for Windows: <git>/mingw64/libexec/git-core -> <git>/usr/bin/sh.exe
+        cand = Path(git("--exec-path").strip()).parents[2] / "usr" / "bin" / "sh.exe"
+        sh = str(cand) if cand.exists() else None
+    return [sh, "-c", '"$0" "$@"', path.as_posix()] if sh else [str(path)]
 
 
 def cmd_review() -> int:
@@ -461,14 +576,14 @@ def cmd_review() -> int:
     if not p.exists():
         print("push-guard: nothing waiting for review in this repo.")
         return 0
-    data = json.loads(p.read_text())
+    data = json.loads(read_text(p))
     reviewed = load_reviewed()
     items = [f for f in data["findings"] if f["fp"] not in reviewed]
     if not items:
         p.unlink()
         print("push-guard: everything already reviewed — push again.")
         return 0
-    tin, tout = open_tty()
+    tin, tout = open_tty(allow_stdin=True)
     if tin is None:
         print("push-guard --review must be run by you in a real terminal (it asks you to confirm).", file=sys.stderr)
         return 1

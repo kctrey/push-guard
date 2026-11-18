@@ -20,10 +20,12 @@ SOURCES_FILE = HERE / "term-sources.txt"
 def sources() -> list[Path]:
     if not SOURCES_FILE.exists():
         return []
-    return [Path(l.strip()).expanduser() for l in SOURCES_FILE.read_text().splitlines()
+    return [Path(l.strip().strip('"')).expanduser() for l in SOURCES_FILE.read_text(encoding="utf-8-sig").splitlines()
             if l.strip() and not l.strip().startswith("#")]
 NAME_COLUMNS = {"account name", "opportunity name", "customer name", "end customer", "customer"}
-DICT = Path("/usr/share/dict/words")
+# A plain-word list keeps single English words out of the term list. macOS/Linux ship one; on
+# Windows, drop any one-word-per-line list at ~/.config/git/push-guard/words.txt.
+DICTS = [Path("/usr/share/dict/words"), HERE / "words.txt"]
 PLACEHOLDERS = {"customername", "oppname", "accountname", "customer", "opportunity", "partnername"}
 
 
@@ -47,7 +49,8 @@ def main() -> None:
     except ImportError:
         sys.exit("openpyxl not available — pip install openpyxl, or put the path of a Python that has it in python.txt")
 
-    common = {w.strip().lower() for w in DICT.read_text().splitlines()} if DICT.exists() else set()
+    common = {w.strip().lower() for d in DICTS if d.exists()
+              for w in d.read_text(encoding="utf-8", errors="replace").splitlines()}
     terms: set[str] = set()
     for path in books:
         try:
@@ -71,7 +74,8 @@ def main() -> None:
     OUT.write_text(
         "# push-guard customer names — generated from your Check Back workbooks; local only.\n"
         + "\n".join(sorted(terms, key=str.lower))
-        + "\n"
+        + "\n",
+        encoding="utf-8",
     )
     OUT.chmod(0o600)
     if not quiet:

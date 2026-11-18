@@ -1,9 +1,18 @@
 #!/bin/sh
 # push-guard pass-through: core.hooksPath bypasses .git/hooks, so run the repo's own hook if it has one.
-# Look in the repo's real hooks folder (git-common-dir); `--git-path hooks` would point back here.
-name=$(basename "$0")
-dir="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
+# The common path (no hook of its own) starts no subshells: on Windows each $(...) costs ~100ms and
+# git runs up to ~10 hooks per commit (reference-transaction alone fires several times).
+name=${0##*/}
+# Git runs hooks from the top of the work tree, so a plain repo's hooks live in ./.git/hooks.
+# Otherwise (worktrees, submodules, bare repos, GIT_DIR set) ask git for the real hooks folder
+# (git-common-dir); `--git-path hooks` would point back here.
+if [ -z "${GIT_DIR:-}" ] && [ -d .git ]; then
+  dir=.git
+else
+  dir="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
+fi
 own="$dir/hooks/$name"
+[ -f "$own" ] || exit 0
 here="$(cd "$(dirname "$0")" && pwd -P)"
 [ -x "$own" ] && [ "$(cd "$(dirname "$own")" && pwd -P)" != "$here" ] && exec "$own" "$@"
 exit 0
